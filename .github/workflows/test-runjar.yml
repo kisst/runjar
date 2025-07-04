@@ -405,3 +405,121 @@ jobs:
           ./runjar test.jar | grep -q "Cross-platform test" || \
             (echo "FAIL: JAR execution does not work on ${{ matrix.os }}" && exit 1)
           echo "✓ JAR execution works on ${{ matrix.os }}"
+
+  test-multi-arch:
+    runs-on: ${{ matrix.os }}
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+        include:
+          - os: ubuntu-latest
+            arch: x64
+          - os: ubuntu-22.04
+            arch: arm64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache Java runtimes
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/runjar
+          key: runjar-cache-${{ matrix.os }}-${{ matrix.arch }}-${{ hashFiles('runjar') }}
+          restore-keys: |
+            runjar-cache-${{ matrix.os }}-${{ matrix.arch }}-
+            runjar-cache-${{ matrix.os }}-
+            runjar-cache-
+
+      - name: Set up Java for test JAR creation
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      - name: Make runjar executable
+        run: chmod +x runjar
+
+      - name: Create architecture test JAR
+        run: |
+          # Create a test JAR that shows architecture info
+          mkdir -p test-src
+          cat > test-src/ArchTest.java << 'EOF'
+          public class ArchTest {
+            public static void main(String[] args) {
+              System.out.println("Architecture test on " + System.getProperty("os.name"));
+              System.out.println("Architecture: " + System.getProperty("os.arch"));
+              System.out.println("Java version: " + System.getProperty("java.version"));
+            }
+          }
+          EOF
+          javac test-src/ArchTest.java -d test-src/
+
+          # Create manifest file
+          cat > test-src/MANIFEST.MF << 'EOF'
+          Manifest-Version: 1.0
+          Main-Class: ArchTest
+
+          EOF
+
+          # Create JAR file
+          jar cfm arch-test.jar test-src/MANIFEST.MF -C test-src/ .
+
+      - name: Test architecture detection
+        run: |
+          echo "Testing architecture detection on ${{ matrix.os }} (${{ matrix.arch }})..."
+
+          # Test help flag
+          ./runjar --help | grep -q "Usage:" || \
+            (echo "FAIL: Help does not work on ${{ matrix.os }} (${{ matrix.arch }})" && exit 1)
+          echo "✓ Help flag works on ${{ matrix.os }} (${{ matrix.arch }})"
+
+          # Test list versions
+          ./runjar --list-versions | grep -q "Java" || \
+            (echo "FAIL: List versions does not work on ${{ matrix.os }} (${{ matrix.arch }})" && exit 1)
+          echo "✓ List versions works on ${{ matrix.os }} (${{ matrix.arch }})"
+
+          # Test cache info
+          ./runjar --cache-info > /dev/null || \
+            (echo "FAIL: Cache info does not work on ${{ matrix.os }} (${{ matrix.arch }})" && exit 1)
+          echo "✓ Cache info works on ${{ matrix.os }} (${{ matrix.arch }})"
+
+          # Test dry run
+          ./runjar --dry-run arch-test.jar | grep -q "Dry run mode" || \
+            (echo "FAIL: Dry run does not work on ${{ matrix.os }} (${{ matrix.arch }})" && exit 1)
+          echo "✓ Dry run works on ${{ matrix.os }} (${{ matrix.arch }})"
+
+          # Test actual execution
+          ./runjar arch-test.jar | grep -q "Architecture test" || \
+            (echo "FAIL: JAR execution does not work on ${{ matrix.os }} (${{ matrix.arch }})" && exit 1)
+          echo "✓ JAR execution works on ${{ matrix.os }} (${{ matrix.arch }})"
+
+      - name: Test architecture-specific features
+        run: |
+          echo "Testing architecture-specific features on ${{ matrix.os }} (${{ matrix.arch }})..."
+
+          # Test that the correct architecture is detected
+          OUTPUT=$(./runjar arch-test.jar)
+          echo "$OUTPUT" | grep -q "Architecture:" || \
+            (echo "FAIL: Architecture info not displayed" && exit 1)
+          echo "✓ Architecture info displayed"
+
+          # Test Java version detection
+          echo "$OUTPUT" | grep -q "Java version:" || \
+            (echo "FAIL: Java version info not displayed" && exit 1)
+          echo "✓ Java version info displayed"
+
+          # Test different Java versions on this architecture
+          echo "Testing Java 11 on ${{ matrix.arch }}..."
+          ./runjar --java-version 11 arch-test.jar | grep -q "Architecture test" || \
+            (echo "FAIL: Java 11 execution failed on ${{ matrix.arch }}" && exit 1)
+          echo "✓ Java 11 works on ${{ matrix.arch }}"
+
+          # Test Java 17 on this architecture
+          echo "Testing Java 17 on ${{ matrix.arch }}..."
+          ./runjar --java-version 17 arch-test.jar | grep -q "Architecture test" || \
+            (echo "FAIL: Java 17 execution failed on ${{ matrix.arch }}" && exit 1)
+          echo "✓ Java 17 works on ${{ matrix.arch }}"
+
+          echo "✓ All architecture tests passed on ${{ matrix.os }} (${{ matrix.arch }})"
