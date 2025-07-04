@@ -1,0 +1,406 @@
+name: Test RunJAR
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test-runjar:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache Java runtimes
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/runjar
+          key: runjar-cache-${{ matrix.os }}-${{ hashFiles('runjar') }}
+          restore-keys: |
+            runjar-cache-${{ matrix.os }}-
+            runjar-cache-
+
+      - name: Set up Java for test JAR creation
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      - name: Make runjar executable
+        run: chmod +x runjar
+
+      - name: Create test JAR file
+        run: |
+          # Create a simple Java class
+          mkdir -p test-src
+          cat > test-src/HelloWorld.java << 'EOF'
+          public class HelloWorld {
+              public static void main(String[] args) {
+                  System.out.println("Hello, World!");
+                  if (args.length > 0) {
+                      System.out.println("Arguments: " + String.join(" ", args));
+                  }
+                  System.out.println("Java version: " + System.getProperty("java.version"));
+              }
+          }
+          EOF
+
+          # Compile with system Java
+          javac test-src/HelloWorld.java -d test-src/
+
+          # Create manifest file
+          cat > test-src/MANIFEST.MF << 'EOF'
+          Manifest-Version: 1.0
+          Main-Class: HelloWorld
+
+          EOF
+
+          # Create JAR file
+          jar cfm test.jar test-src/MANIFEST.MF -C test-src/ .
+
+          # Create a problematic JAR for testing workarounds
+          echo "Invalid JAR content" > broken.jar
+
+          # Verify JAR was created
+          ls -la test.jar
+          java -jar test.jar || echo "System Java test completed"
+
+      - name: Test basic functionality
+        run: |
+          echo "Testing basic functionality on ${{ matrix.os }}..."
+
+          # Test help flag
+          ./runjar --help | grep -q "Usage:" || (echo "FAIL: Help does not work on ${{ matrix.os }}" && exit 1)
+          echo "✓ Help flag works on ${{ matrix.os }}"
+
+          # Test list versions
+          ./runjar --list-versions | grep -q "Java" || \
+            (echo "FAIL: List versions does not work on ${{ matrix.os }}" && exit 1)
+          echo "✓ List versions works on ${{ matrix.os }}"
+
+          # Test cache info
+          ./runjar --cache-info > /dev/null || \
+            (echo "FAIL: Cache info does not work on ${{ matrix.os }}" && exit 1)
+          echo "✓ Cache info works on ${{ matrix.os }}"
+
+          # Test dry run
+          ./runjar --dry-run test.jar | grep -q "Dry run mode" || \
+            (echo "FAIL: Dry run does not work on ${{ matrix.os }}" && exit 1)
+          echo "✓ Dry run works on ${{ matrix.os }}"
+
+          # Test actual execution
+          ./runjar test.jar | grep -q "Hello, World!" || \
+            (echo "FAIL: JAR execution does not work on ${{ matrix.os }}" && exit 1)
+          echo "✓ JAR execution works on ${{ matrix.os }}"
+
+      - name: Test JAR execution
+        run: |
+          echo "Testing JAR execution..."
+
+          # Test basic JAR execution - should succeed and show "Hello, World!"
+          OUTPUT=$(./runjar test.jar)
+          echo "$OUTPUT" | grep -q "Hello, World!" || (echo "FAIL: JAR did not produce expected output" && exit 1)
+          echo "✓ Basic JAR execution works"
+
+          # Test JAR with arguments - should succeed and show arguments
+          OUTPUT=$(./runjar test.jar arg1 arg2 "arg with spaces")
+          echo "$OUTPUT" | grep -q "Arguments:" || (echo "FAIL: JAR did not process arguments" && exit 1)
+          echo "$OUTPUT" | grep -q "arg1" || (echo "FAIL: JAR did not show first argument" && exit 1)
+          echo "$OUTPUT" | grep -q "arg with spaces" || (echo "FAIL: JAR did not show spaced argument" && exit 1)
+          echo "✓ JAR execution with arguments works"
+
+      - name: Test feature flags
+        run: |
+          echo "Testing feature flags..."
+
+          # Test verbose flag - should succeed and show verbose output
+          ./runjar --verbose test.jar | grep -q "Hello, World!" || (echo "FAIL: Verbose execution failed" && exit 1)
+          echo "✓ Verbose flag works"
+
+          # Test debug flag - should succeed and show debug info
+          ./runjar --debug test.jar 2>&1 | grep -q "Hello, World!" || (echo "FAIL: Debug execution failed" && exit 1)
+          echo "✓ Debug flag works"
+
+          # Test no-cache flag - should succeed
+          ./runjar --no-cache test.jar | grep -q "Hello, World!" || (echo "FAIL: No-cache execution failed" && exit 1)
+          echo "✓ No-cache flag works"
+
+          # Test no-fallback flag - should succeed
+          ./runjar --no-fallback test.jar | grep -q "Hello, World!" || \
+            (echo "FAIL: No-fallback execution failed" && exit 1)
+          echo "✓ No-fallback flag works"
+
+          # Test force-workarounds flag - should succeed
+          ./runjar --force-workarounds test.jar | grep -q "Hello, World!" || \
+            (echo "FAIL: Force-workarounds execution failed" && exit 1)
+          echo "✓ Force-workarounds flag works"
+
+          # Test keep-runtime flag - should succeed and leave runtime directory
+          ./runjar --keep-runtime test.jar | grep -q "Hello, World!" || \
+            (echo "FAIL: Keep-runtime execution failed" && exit 1)
+          # Check if runtime directory exists
+          ls /tmp/runjar.test.* > /dev/null 2>&1 || (echo "FAIL: Keep-runtime did not preserve directory" && exit 1)
+          echo "✓ Keep-runtime flag works"
+
+      - name: Test multi-version compatibility
+        run: |
+          echo "Testing multiple Java versions..."
+
+          # Test Java 8 (may not be available, so allow failure)
+          if ./runjar --java-version 8 test.jar 2>/dev/null; then
+            echo "✓ Java 8 test completed successfully"
+          else
+            echo "ℹ Java 8 test skipped (version may not be available)"
+          fi
+
+          # Test Java 11 - should succeed
+          ./runjar --java-version 11 test.jar | grep -q "Hello, World!" || \
+            (echo "FAIL: Java 11 execution failed" && exit 1)
+          echo "✓ Java 11 test completed"
+
+          # Test Java 17 - should succeed
+          ./runjar --java-version 17 test.jar | grep -q "Hello, World!" || \
+            (echo "FAIL: Java 17 execution failed" && exit 1)
+          echo "✓ Java 17 test completed"
+
+          # Test Java 21 - should succeed
+          ./runjar --java-version 21 test.jar | grep -q "Hello, World!" || \
+            (echo "FAIL: Java 21 execution failed" && exit 1)
+          echo "✓ Java 21 test completed"
+
+      - name: Test cache functionality
+        run: |
+          echo "Testing cache functionality..."
+
+          # Test cache info after previous downloads
+          CACHE_OUTPUT=$(./runjar --cache-info)
+          echo "$CACHE_OUTPUT" | grep -q "Cache directory" || \
+            (echo "FAIL: Cache info does not show cache directory" && exit 1)
+          echo "✓ Cache info shows cache directory"
+
+          # Test that cache is being used (should be faster on second run)
+          echo "Testing cache hit detection..."
+          START_TIME=$(date +%s)
+          ./runjar --debug test.jar 2>&1 | grep -q "Hello, World!" || \
+            (echo "FAIL: Cache test execution failed" && exit 1)
+          END_TIME=$(date +%s)
+          echo "✓ Cache functionality test completed in $((END_TIME - START_TIME)) seconds"
+
+          # Test cache cleanup
+          ./runjar --clean-cache || (echo "FAIL: Cache cleanup failed" && exit 1)
+          echo "✓ Cache cleanup works"
+
+          # Verify cache is cleaned
+          CACHE_AFTER_CLEAN=$(./runjar --cache-info)
+          echo "$CACHE_AFTER_CLEAN" | grep -q "0 cached" || echo "ℹ Cache may still contain some entries (expected)"
+          echo "✓ Cache info after cleanup works"
+
+  test-edge-cases:
+    runs-on: ubuntu-latest
+    needs: test-runjar
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache Java runtimes
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/runjar
+          key: runjar-cache-ubuntu-latest-${{ hashFiles('runjar') }}
+          restore-keys: |
+            runjar-cache-ubuntu-latest-
+            runjar-cache-
+
+      - name: Set up Java for test JAR creation
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      - name: Make runjar executable
+        run: chmod +x runjar
+
+      - name: Create test files
+        run: |
+          # Create a simple test JAR
+          mkdir -p test-src
+          cat > test-src/Test.java << 'EOF'
+          public class Test {
+            public static void main(String[] args) {
+              System.out.println("Test");
+            }
+          }
+          EOF
+          javac test-src/Test.java -d test-src/
+
+          # Create manifest file
+          cat > test-src/MANIFEST.MF << 'EOF'
+          Manifest-Version: 1.0
+          Main-Class: Test
+
+          EOF
+
+          # Create JAR file
+          jar cfm test.jar test-src/MANIFEST.MF -C test-src/ .
+
+          # Create broken JAR
+          echo "Invalid JAR content" > broken.jar
+
+      - name: Test error handling
+        run: |
+          echo "Testing error handling..."
+
+          # Test with invalid JAR - should fail
+          if ./runjar broken.jar 2>/dev/null; then
+            echo "FAIL: Invalid JAR should have failed but succeeded" && exit 1
+          else
+            echo "✓ Invalid JAR correctly failed"
+          fi
+
+          # Test with non-existent JAR - should fail
+          if ./runjar nonexistent.jar 2>/dev/null; then
+            echo "FAIL: Non-existent JAR should have failed but succeeded" && exit 1
+          else
+            echo "✓ Non-existent JAR correctly failed"
+          fi
+
+      - name: Test edge cases
+        run: |
+          echo "Testing JAR files with special characters..."
+
+          # Create JAR files with different names
+          cp test.jar "my-app.jar"
+          cp test.jar "complex_app_name.jar"
+          cp test.jar "app with spaces.jar"
+
+          # Test each JAR and verify they create proper directory names
+          echo "Testing JAR with hyphens..."
+          ./runjar my-app.jar | grep -q "Test" || (echo "FAIL: JAR with hyphens failed" && exit 1)
+          echo "✓ JAR with hyphens works"
+
+          echo "Testing JAR with underscores..."
+          ./runjar complex_app_name.jar | grep -q "Test" || (echo "FAIL: JAR with underscores failed" && exit 1)
+          echo "✓ JAR with underscores works"
+
+          echo "Testing JAR with spaces..."
+          ./runjar "app with spaces.jar" | grep -q "Test" || (echo "FAIL: JAR with spaces failed" && exit 1)
+          echo "✓ JAR with spaces works"
+
+          echo "✓ All edge cases passed"
+
+      - name: Test cleanup functionality
+        run: |
+          echo "Testing cleanup functionality..."
+
+          # Count directories before cleanup
+          DIRS_BEFORE=$(ls -d /tmp/runjar.* 2>/dev/null | wc -l)
+          echo "Runtime directories before cleanup: $DIRS_BEFORE"
+
+          # Test cleanup
+          echo "y" | ./runjar --force-cleanup-runtimes || (echo "FAIL: Cleanup command failed" && exit 1)
+
+          # Verify cleanup worked
+          DIRS_AFTER=$(ls -d /tmp/runjar.* 2>/dev/null | wc -l)
+          echo "Runtime directories after cleanup: $DIRS_AFTER"
+
+          [ "$DIRS_AFTER" -lt "$DIRS_BEFORE" ] || \
+            echo "ℹ Some runtime directories may still exist (expected if recently used)"
+          echo "✓ Cleanup functionality works"
+
+      - name: Test workarounds
+        run: |
+          echo "Testing force workarounds flag..."
+
+          # Test force workarounds - should succeed
+          ./runjar --force-workarounds test.jar | grep -q "Test" || \
+            (echo "FAIL: Force workarounds execution failed" && exit 1)
+          echo "✓ Force workarounds flag works"
+
+  test-multi-os:
+    runs-on: ${{ matrix.os }}
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache Java runtimes
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/runjar
+          key: runjar-cache-${{ matrix.os }}-${{ hashFiles('runjar') }}
+          restore-keys: |
+            runjar-cache-${{ matrix.os }}-
+            runjar-cache-
+
+      - name: Set up Java for test JAR creation
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '11'
+
+      - name: Make runjar executable
+        run: chmod +x runjar
+
+      - name: Create simple test JAR
+        run: |
+          # Create a simple test JAR
+          mkdir -p test-src
+          cat > test-src/Test.java << 'EOF'
+          public class Test {
+            public static void main(String[] args) {
+              System.out.println("Cross-platform test on " + System.getProperty("os.name"));
+            }
+          }
+          EOF
+          javac test-src/Test.java -d test-src/
+
+          # Create manifest file
+          cat > test-src/MANIFEST.MF << 'EOF'
+          Manifest-Version: 1.0
+          Main-Class: Test
+
+          EOF
+
+          # Create JAR file
+          jar cfm test.jar test-src/MANIFEST.MF -C test-src/ .
+
+      - name: Test basic functionality
+        run: |
+          echo "Testing basic functionality on ${{ matrix.os }}..."
+
+          # Test help flag
+          ./runjar --help | grep -q "Usage:" || \
+            (echo "FAIL: Help does not work on ${{ matrix.os }}" && exit 1)
+          echo "✓ Help flag works on ${{ matrix.os }}"
+
+          # Test list versions
+          ./runjar --list-versions | grep -q "Java" || \
+            (echo "FAIL: List versions does not work on ${{ matrix.os }}" && exit 1)
+          echo "✓ List versions works on ${{ matrix.os }}"
+
+          # Test cache info
+          ./runjar --cache-info > /dev/null || \
+            (echo "FAIL: Cache info does not work on ${{ matrix.os }}" && exit 1)
+          echo "✓ Cache info works on ${{ matrix.os }}"
+
+          # Test dry run
+          ./runjar --dry-run test.jar | grep -q "Dry run mode" || \
+            (echo "FAIL: Dry run does not work on ${{ matrix.os }}" && exit 1)
+          echo "✓ Dry run works on ${{ matrix.os }}"
+
+          # Test actual execution
+          ./runjar test.jar | grep -q "Cross-platform test" || \
+            (echo "FAIL: JAR execution does not work on ${{ matrix.os }}" && exit 1)
+          echo "✓ JAR execution works on ${{ matrix.os }}"

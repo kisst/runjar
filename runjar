@@ -1,0 +1,940 @@
+#!/bin/bash
+
+# RunJAR - Cached JAR Runner
+# Downloads Java runtime (cached locally), runs JAR file, then deletes runtime after execution
+# Persistent cache - runtime is downloaded once and reused
+# Automatically tries different Java versions if the first one fails
+
+set -e
+
+# Configuration
+JAVA_VERSION="24"
+CACHE_DIR="${HOME}/.cache/runjar"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Global variables
+TEMP_DIR=""
+JAVA_DIR=""
+CLEANUP_REGISTERED=false
+
+# Logging functions
+log() {
+    echo -e "${GREEN}[INFO]${NC} $1" >&2
+}
+
+cache_log() {
+    echo -e "${GREEN}[INFO]${NC} $1"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1" >&2
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $1" >&2
+}
+
+debug() {
+    if [ "${DEBUG:-0}" = "1" ]; then
+        echo -e "${BLUE}[DEBUG]${NC} $1" >&2
+    fi
+}
+
+# Show usage information
+show_usage() {
+    cat << EOF
+Usage: runjar [OPTIONS] <jar-file> [jar-arguments...]
+
+RunJAR - Cached JAR Runner - Downloads Java runtime (cached), runs JAR, then deletes runtime
+
+OPTIONS:
+    -h, --help          Show this help message
+    -v, --verbose       Enable verbose output
+    -d, --debug         Enable debug output (shows full download progress)
+    --java-version VER  Java version to use (default: $JAVA_VERSION - Latest LTS)
+    --keep-runtime      Don't delete runtime after execution
+    --no-fallback       Don't try different Java versions if the first one fails
+    --force-workarounds Force JVM workarounds for problematic JAR files
+    --no-cache          Skip cache, force download
+    --cache-info        Show cache information and exit
+    --clean-cache       Clean cache directory and exit
+    --force-cleanup-runtimes Force cleanup all runjar temporary directories and exit
+    --list-versions     Show all supported Java versions (fetched from Adoptium) and exit
+    --dry-run           Show what would be done without executing
+
+EXAMPLES:
+    runjar app.jar
+    runjar --java-version 11 app.jar --server-port 8080
+    runjar --verbose app.jar
+    runjar --keep-runtime app.jar
+    runjar --no-fallback app.jar
+    runjar --force-workarounds app.jar
+    runjar --no-cache app.jar
+    runjar --cache-info
+    runjar --clean-cache
+    runjar --force-cleanup-runtimes
+    runjar --list-versions
+
+ENVIRONMENT VARIABLES:
+    JAVA_VERSION        Override default Java version
+    DEBUG               Enable debug output (0/1)
+
+NOTE: RunJAR caches Java runtimes in '~/.cache/runjar' directory to avoid re-downloading.
+      Automatically tries different Java versions if the first one fails.
+      Has built-in workarounds for problematic JAR files with bytecode issues.
+      Downloads are quiet by default - use --debug to see full download progress.
+      Supported versions are fetched dynamically from Adoptium OpenJDK.
+      Use --no-cache to force fresh download. Use --force-workarounds for problematic JARs.
+
+EOF
+}
+
+# Detect system architecture
+detect_architecture() {
+    local arch
+    arch="$(uname -m)"
+
+    case "$arch" in
+        x86_64)
+            echo "x64"
+            ;;
+        aarch64|arm64)
+            echo "aarch64"
+            ;;
+        armv7l)
+            echo "arm"
+            ;;
+        i386|i686)
+            echo "x32"
+            ;;
+        *)
+            error "Unsupported architecture: $arch"
+            exit 1
+            ;;
+    esac
+}
+
+# Detect operating system
+detect_os() {
+    local os
+    os="$(uname -s)"
+
+    case "$os" in
+        Linux)
+            echo "linux"
+            ;;
+        Darwin)
+            echo "mac"
+            ;;
+        CYGWIN*|MINGW*|MSYS*)
+            echo "windows"
+            ;;
+        *)
+            error "Unsupported operating system: $os"
+            exit 1
+            ;;
+    esac
+}
+
+# Get cache key for Java runtime
+get_cache_key() {
+    local version="$1"
+    local os="$2"
+    local arch="$3"
+    echo "java-${version}-${os}-${arch}.tar.gz"
+}
+
+# Extract and sanitize JAR filename for directory naming
+sanitize_jar_name() {
+    local jar_file="$1"
+    local basename
+    basename="$(basename "$jar_file")"
+    local name="${basename%.jar}"
+    # Replace problematic characters with underscores
+    name="${name//[^a-zA-Z0-9._-]/_}"
+    # Truncate if too long
+    if [ ${#name} -gt 30 ]; then
+        name="${name:0:30}"
+    fi
+    echo "$name"
+}
+
+# Check if Java runtime is cached
+is_cached() {
+    local version="$1"
+    local os="$2"
+    local arch="$3"
+    local cache_file
+    cache_file="$CACHE_DIR/$(get_cache_key "$version" "$os" "$arch")"
+
+    if [ -f "$cache_file" ]; then
+        debug "Cache hit: $cache_file"
+        return 0
+    else
+        debug "Cache miss: $cache_file"
+        return 1
+    fi
+}
+
+# Load Java runtime from cache
+load_from_cache() {
+    local version="$1"
+    local os="$2"
+    local arch="$3"
+    local jar_file="$4"
+    local cache_file
+    cache_file="$CACHE_DIR/$(get_cache_key "$version" "$os" "$arch")"
+
+    if [ ! -f "$cache_file" ]; then
+        error "Cache file not found: $cache_file"
+        return 1
+    fi
+
+    cache_log "Loading Java $version from cache..."
+    debug "Cache file: $cache_file"
+    debug "Cache location: $CACHE_DIR"
+
+    # Create temporary directory if not exists
+    if [ -z "$TEMP_DIR" ]; then
+        local jar_name
+        jar_name="$(sanitize_jar_name "$jar_file")"
+        TEMP_DIR="$(mktemp -d -t runjar.${jar_name}.XXXXXX)"
+        register_cleanup
+    fi
+
+    JAVA_DIR="$TEMP_DIR/java"
+
+    # Extract from cache
+    local extract_dir="$TEMP_DIR/extract"
+    mkdir -p "$extract_dir"
+
+    if tar -xzf "$cache_file" -C "$extract_dir"; then
+        # Find the extracted directory
+        local extracted_dir
+        extracted_dir="$(find "$extract_dir" -maxdepth 1 -type d -name "*jre*" -o -name "*jdk*" | head -n1)"
+
+        if [ -z "$extracted_dir" ]; then
+            extracted_dir="$(find "$extract_dir" -maxdepth 1 -type d | tail -n1)"
+        fi
+
+        if [ -z "$extracted_dir" ]; then
+            error "Could not find extracted Java directory from cache"
+            return 1
+        fi
+
+        # Move to final location
+        mv "$extracted_dir" "$JAVA_DIR"
+
+        # Clean up extract directory
+        rm -rf "$extract_dir"
+
+        # Make java executable
+        chmod +x "$JAVA_DIR/bin/java"
+
+        cache_log "Java runtime loaded from cache: $JAVA_DIR"
+        debug "Java runtime size: $(du -sh "$JAVA_DIR" 2>/dev/null | cut -f1)"
+        cache_log "Cache hit - no download needed!"
+        return 0
+    else
+        error "Failed to extract Java runtime from cache"
+        return 1
+    fi
+}
+
+# Save Java runtime to cache
+save_to_cache() {
+    local version="$1"
+    local os="$2"
+    local arch="$3"
+    local source_file="$4"
+    local cache_file
+    cache_file="$CACHE_DIR/$(get_cache_key "$version" "$os" "$arch")"
+
+    # Create cache directory if it doesn't exist
+    mkdir -p "$CACHE_DIR"
+
+    log "Saving Java $version to cache..."
+    debug "Cache file: $cache_file"
+
+    # Copy the downloaded file to cache
+    if cp "$source_file" "$cache_file"; then
+        debug "Java runtime cached successfully"
+        debug "Cache size: $(du -sh "$cache_file" 2>/dev/null | cut -f1)"
+        return 0
+    else
+        error "Failed to save Java runtime to cache"
+        return 1
+    fi
+}
+
+# Clean cache
+clean_cache() {
+    if [ -d "$CACHE_DIR" ]; then
+        log "Cleaning cache directory: $CACHE_DIR"
+        rm -rf "$CACHE_DIR"
+        log "Cache cleaned"
+    else
+        log "No cache directory to clean"
+    fi
+}
+
+# Force cleanup all runjar temporary directories
+force_cleanup_runtimes() {
+    log "Searching for runjar temporary directories..."
+
+    # Find all runjar.* directories in /tmp and similar temp locations
+    local temp_dirs=()
+    local temp_roots=()
+    local count=0
+
+    # Get unique temporary directory locations
+    for temp_root in /tmp /var/tmp "${TMPDIR:-/tmp}"; do
+        if [ -d "$temp_root" ]; then
+            # Check if this path is already in our list (resolve symlinks)
+            local resolved_path
+            resolved_path="$(readlink -f "$temp_root" 2>/dev/null || echo "$temp_root")"
+            local already_added=false
+            for existing in "${temp_roots[@]}"; do
+                if [ "$resolved_path" = "$existing" ]; then
+                    already_added=true
+                    break
+                fi
+            done
+
+            if [ "$already_added" = false ]; then
+                temp_roots+=("$resolved_path")
+            fi
+        fi
+    done
+
+    # Search for runjar directories in unique temp roots
+    for temp_root in "${temp_roots[@]}"; do
+        while IFS= read -r -d '' dir; do
+            if [ -d "$dir" ]; then
+                temp_dirs+=("$dir")
+                count=$((count + 1))
+            fi
+        done < <(find "$temp_root" -maxdepth 1 -type d -name "runjar.*.*" -print0 2>/dev/null)
+    done
+
+    if [ "$count" -eq 0 ]; then
+        log "No runjar temporary directories found"
+        return 0
+    fi
+
+    log "Found $count runjar temporary directories:"
+    for dir in "${temp_dirs[@]}"; do
+        local size
+        size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
+        log "  $dir ($size)"
+    done
+
+    # Ask for confirmation unless in non-interactive mode
+    if [ -t 0 ] && [ -t 1 ]; then
+        echo ""
+        echo -n "Delete all found runjar temporary directories? [y/N]: "
+        read -r response
+        case "$response" in
+            [yY]|[yY][eE][sS])
+                ;;
+            *)
+                log "Operation cancelled"
+                return 0
+                ;;
+        esac
+    fi
+
+    log "Removing runjar temporary directories..."
+    local removed=0
+    for dir in "${temp_dirs[@]}"; do
+        if rm -rf "$dir" 2>/dev/null; then
+            debug "Removed: $dir"
+            removed=$((removed + 1))
+        else
+            warn "Failed to remove: $dir"
+        fi
+    done
+
+    if [ "$removed" -eq "$count" ]; then
+        log "Successfully removed $removed runjar temporary directories"
+    else
+        warn "Removed $removed out of $count directories"
+    fi
+}
+
+# Show cache information
+show_cache_info() {
+    echo "Cache directory: $CACHE_DIR"
+
+    if [ -d "$CACHE_DIR" ]; then
+        local cache_size
+        cache_size="$(du -sh "$CACHE_DIR" 2>/dev/null | cut -f1)"
+        echo "Cache size: $cache_size"
+
+        local cache_count
+        cache_count="$(find "$CACHE_DIR" -name "*.tar.gz" 2>/dev/null | wc -l)"
+        echo "Cached runtimes: $cache_count"
+
+        if [ "$cache_count" -gt 0 ]; then
+            echo "Cached files:"
+            find "$CACHE_DIR" -name "*.tar.gz" -exec basename {} \; 2>/dev/null | sort
+        fi
+    else
+        echo "Cache directory does not exist"
+    fi
+}
+
+# Fetch available Java versions from Adoptium API
+fetch_available_versions() {
+    local api_url="https://api.adoptium.net/v3/info/available_releases"
+    local temp_file
+    temp_file="$(mktemp)"
+
+    # Try to fetch version info
+    if command -v curl >/dev/null 2>&1; then
+        if curl -s -o "$temp_file" "$api_url" 2>/dev/null; then
+            # Parse JSON to extract available versions
+            if command -v jq >/dev/null 2>&1; then
+                jq -r '.available_releases[]' "$temp_file" 2>/dev/null | sort -n
+            else
+                # Fallback parsing without jq
+                grep -o '"available_releases":\[[^]]*\]' "$temp_file" 2>/dev/null | \
+                    sed 's/.*\[\([^]]*\)\].*/\1/' | \
+                    tr ',' '\n' | \
+                    tr -d ' "' | \
+                    grep '^[0-9]\+$' | \
+                    sort -n
+            fi
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        if wget -q -O "$temp_file" "$api_url" 2>/dev/null; then
+            # Parse JSON to extract available versions
+            if command -v jq >/dev/null 2>&1; then
+                jq -r '.available_releases[]' "$temp_file" 2>/dev/null | sort -n
+            else
+                # Fallback parsing without jq
+                grep -o '"available_releases":\[[^]]*\]' "$temp_file" 2>/dev/null | \
+                    sed 's/.*\[\([^]]*\)\].*/\1/' | \
+                    tr ',' '\n' | \
+                    tr -d ' "' | \
+                    grep '^[0-9]\+$' | \
+                    sort -n
+            fi
+        fi
+    fi
+
+    # Clean up
+    rm -f "$temp_file" 2>/dev/null
+}
+
+# Get version description
+get_version_description() {
+    local version="$1"
+    case "$version" in
+        8)
+            echo "Java 8 (Legacy LTS) - Best compatibility for old applications"
+            ;;
+        11)
+            echo "Java 11 (LTS) - Good balance of features and stability"
+            ;;
+        17)
+            echo "Java 17 (LTS) - Modern features, recommended for new development"
+            ;;
+        21)
+            echo "Java 21 (LTS) - Previous LTS with modern features"
+            ;;
+        24)
+            echo "Java 24 (LTS) - Latest LTS with newest features"
+            ;;
+        *)
+            # LTS versions: 8, 11, 17, 21, then every 3 years after 21
+            if [ "$version" -gt 21 ] && [ $((($version - 21) % 3)) -eq 0 ]; then
+                echo "Java $version (LTS) - Long Term Support version"
+            else
+                echo "Java $version - Non-LTS version"
+            fi
+            ;;
+    esac
+}
+
+# Show supported Java versions
+show_supported_versions() {
+    echo "Fetching supported Java versions from Adoptium..."
+    echo ""
+
+    local versions
+    versions="$(fetch_available_versions)"
+
+    if [ -n "$versions" ]; then
+        echo "Supported Java Versions:"
+        echo ""
+
+        while IFS= read -r version; do
+            if [ -n "$version" ]; then
+                printf "  %-3s - %s\n" "$version" "$(get_version_description "$version")"
+            fi
+        done <<< "$versions"
+
+        echo ""
+        echo "Default version: $JAVA_VERSION"
+
+        # Show fallback versions from the fetched list
+        local fallback_list="21, 17, 11, 8"
+        echo "Fallback order: $fallback_list (if primary version fails)"
+    else
+        warn "Could not fetch version list from Adoptium API"
+        echo "Using fallback version information:"
+        echo ""
+        echo "  8   - Java 8 (Legacy LTS) - Best compatibility for old applications"
+        echo "  11  - Java 11 (LTS) - Default version, good balance of features and stability"
+        echo "  17  - Java 17 (LTS) - Modern features, recommended for new development"
+        echo "  21  - Java 21 (LTS) - Latest LTS with newest features"
+        echo ""
+        echo "Default version: $JAVA_VERSION"
+        echo "Fallback order: 21, 17, 11, 8 (if primary version fails)"
+    fi
+
+    echo ""
+    echo "Usage examples:"
+    echo "  runjar app.jar                    # Use default version ($JAVA_VERSION - Latest LTS)"
+    echo "  runjar --java-version 11 app.jar # Use specific version"
+    echo "  runjar --no-fallback app.jar     # Disable automatic fallback"
+    echo ""
+    echo "Note: Only LTS (Long Term Support) versions are recommended for production use."
+}
+
+# Get Java download URL
+get_java_url() {
+    local version="$1"
+    local os="$2"
+    local arch="$3"
+    local api_url="https://api.adoptium.net/v3/binary/latest/${version}/ga/${os}/${arch}/jre/hotspot/normal/eclipse"
+
+    debug "Java download URL: $api_url"
+    echo "$api_url"
+}
+
+# Cleanup function
+cleanup() {
+    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+        log "Cleaning up temporary directory..."
+        rm -rf "$TEMP_DIR"
+        debug "Removed: $TEMP_DIR"
+    fi
+}
+
+# Register cleanup function
+register_cleanup() {
+    if [ "$CLEANUP_REGISTERED" = false ]; then
+        trap cleanup EXIT INT TERM
+        CLEANUP_REGISTERED=true
+        debug "Cleanup handlers registered"
+    fi
+}
+
+# Download and extract Java runtime
+download_java() {
+    local version="$1"
+    local os="$2"
+    local arch="$3"
+    local skip_cache="${4:-false}"
+    local jar_file="$5"
+
+    # Check if runtime is cached first (unless cache is disabled)
+    if [ "$skip_cache" != true ] && is_cached "$version" "$os" "$arch"; then
+        cache_log "Found Java $version runtime in cache"
+        if load_from_cache "$version" "$os" "$arch" "$jar_file"; then
+            return 0
+        else
+            warn "Failed to load from cache, downloading fresh copy"
+        fi
+    fi
+
+    local download_url
+    local temp_file
+
+    log "Downloading Java $version runtime for $os/$arch..."
+
+    # Create temporary directory
+    local jar_name
+    jar_name="$(sanitize_jar_name "$jar_file")"
+    TEMP_DIR="$(mktemp -d -t runjar.${jar_name}.XXXXXX)"
+    JAVA_DIR="$TEMP_DIR/java"
+    register_cleanup
+
+    debug "Temporary directory: $TEMP_DIR"
+
+    # Get download URL
+    download_url="$(get_java_url "$version" "$os" "$arch")"
+    temp_file="$TEMP_DIR/java-runtime.tar.gz"
+
+    # Download with appropriate verbosity
+    if command -v wget >/dev/null 2>&1; then
+        if [ "${DEBUG:-0}" = "1" ]; then
+            # Show full wget output in debug mode
+            wget -O "$temp_file" "$download_url" --progress=bar:force 2>&1
+        else
+            # Quiet mode with progress bar
+            echo -e "${GREEN}[INFO]${NC} Downloading... "
+            wget -O "$temp_file" "$download_url" --progress=bar:force 2>&1 | \
+                grep -E "^ *[^ ]+.*%.*$" | tail -n 1
+
+            if [ ${PIPESTATUS[0]} -eq 0 ] && [ -f "$temp_file" ] && [ -s "$temp_file" ]; then
+                echo -e "${GREEN}[INFO]${NC} Download completed successfully"
+            else
+                error "Download failed"
+                exit 1
+            fi
+        fi
+    elif command -v curl >/dev/null 2>&1; then
+        if [ "${DEBUG:-0}" = "1" ]; then
+            # Show full curl output in debug mode
+            curl -L -o "$temp_file" "$download_url" --progress-bar
+        else
+            # Quiet mode with progress bar only
+            echo -e "${GREEN}[INFO]${NC} Downloading... "
+            curl -L -o "$temp_file" "$download_url" --progress-bar 2>&1
+            if [ $? -eq 0 ] && [ -f "$temp_file" ]; then
+                echo -e "${GREEN}[INFO]${NC} Download completed successfully"
+            else
+                error "Download failed"
+                exit 1
+            fi
+        fi
+    else
+        error "Neither wget nor curl is available for downloading"
+        exit 1
+    fi
+
+    # Save to cache before extracting (unless cache is disabled)
+    if [ "$skip_cache" != true ]; then
+        save_to_cache "$version" "$os" "$arch" "$temp_file"
+    fi
+
+    log "Extracting Java runtime..."
+
+    # Extract to temporary directory
+    local extract_dir="$TEMP_DIR/extract"
+    mkdir -p "$extract_dir"
+
+    if tar -tf "$temp_file" >/dev/null 2>&1; then
+        tar -xzf "$temp_file" -C "$extract_dir"
+    else
+        error "Downloaded file is not a valid tar.gz archive"
+        exit 1
+    fi
+
+    # Find the extracted directory (it usually has a version-specific name)
+    local extracted_dir
+    extracted_dir="$(find "$extract_dir" -maxdepth 1 -type d -name "*jre*" -o -name "*jdk*" | head -n1)"
+
+    if [ -z "$extracted_dir" ]; then
+        # If no jre/jdk directory found, use the first directory
+        extracted_dir="$(find "$extract_dir" -maxdepth 1 -type d | tail -n1)"
+    fi
+
+    if [ -z "$extracted_dir" ]; then
+        error "Could not find extracted Java directory"
+        exit 1
+    fi
+
+    # Move to final location
+    mv "$extracted_dir" "$JAVA_DIR"
+
+    # Remove temporary files
+    rm -f "$temp_file"
+    rm -rf "$extract_dir"
+
+    # Make java executable
+    chmod +x "$JAVA_DIR/bin/java"
+
+    log "Java runtime extracted to: $JAVA_DIR"
+    debug "Java runtime size: $(du -sh "$JAVA_DIR" 2>/dev/null | cut -f1)"
+}
+
+# Try running JAR with different Java versions if it fails
+try_with_fallback_versions() {
+    local jar_file="$1"
+    local skip_cache="$2"
+    local force_workarounds="$3"
+    shift 3
+    local jar_args=("$@")
+    local java_exec="$JAVA_DIR/bin/java"
+    local fallback_versions=("21" "17" "11" "8")
+
+    # Primary version already failed, try fallback versions
+    warn "Java $JAVA_VERSION failed to run the JAR file"
+    log "Trying fallback Java versions..."
+
+    for version in "${fallback_versions[@]}"; do
+        if [ "$version" = "$JAVA_VERSION" ]; then
+            continue # Skip if it's the same version we already tried
+        fi
+
+        log "Trying Java $version..."
+
+        # Download and try this version
+        local old_java_dir="$JAVA_DIR"
+        download_java "$version" "$(detect_os)" "$(detect_architecture)" "$skip_cache" "$jar_file"
+
+        # Use run_jar function to get all the workarounds
+        if run_jar "$jar_file" "$skip_cache" "$force_workarounds" "${jar_args[@]}"; then
+            log "Successfully ran JAR with Java $version"
+            return 0
+        fi
+
+        # Clean up this version and restore the old path
+        rm -rf "$JAVA_DIR"
+        JAVA_DIR="$old_java_dir"
+    done
+
+    error "JAR file failed to run with all attempted Java versions"
+    return 1
+}
+
+# Run JAR file with temporary Java
+run_jar() {
+    local jar_file="$1"
+    local skip_cache="$2"
+    local force_workarounds="$3"
+    shift 3
+    local jar_args=("$@")
+
+    # Validate JAR file
+    if [ ! -f "$jar_file" ]; then
+        error "JAR file not found: $jar_file"
+        exit 1
+    fi
+
+    # Detect system
+    local os arch java_exec
+    os="$(detect_os)"
+    arch="$(detect_architecture)"
+
+    debug "System: $os/$arch"
+    debug "Java version: $JAVA_VERSION"
+
+    # Download Java runtime
+    download_java "$JAVA_VERSION" "$os" "$arch" "$skip_cache" "$jar_file"
+    java_exec="$JAVA_DIR/bin/java"
+
+    if [ ! -x "$java_exec" ]; then
+        error "Java executable not found or not executable: $java_exec"
+        exit 1
+    fi
+
+    # Show Java version
+    log "Using temporary Java runtime"
+    debug "Java version: $("$java_exec" -version 2>&1 | head -n1)"
+
+    # Validate JAR file format
+    log "Validating JAR file format..."
+    if command -v file >/dev/null 2>&1; then
+        debug "File type: $(file "$jar_file")"
+    fi
+
+    if command -v unzip >/dev/null 2>&1; then
+        debug "JAR contents check:"
+        if unzip -t "$jar_file" >/dev/null 2>&1; then
+            debug "JAR file structure appears valid"
+        else
+            warn "JAR file may be corrupted or not a valid ZIP archive"
+        fi
+    fi
+
+    # Run the JAR file
+    log "Running JAR file: $jar_file"
+    if [ "${#jar_args[@]}" -gt 0 ]; then
+        debug "Arguments: ${jar_args[*]}"
+    fi
+
+    # Execute Java with the JAR file
+    if [ "$force_workarounds" != true ]; then
+        log "Trying standard execution..."
+        if "$java_exec" -jar "$jar_file" "${jar_args[@]}"; then
+            log "JAR execution completed successfully"
+            return 0
+        fi
+
+        # Try with bytecode verification disabled
+        warn "Standard execution failed, trying with disabled bytecode verification..."
+    else
+        log "Forcing workarounds for problematic JAR file..."
+        warn "Trying with disabled bytecode verification..."
+    fi
+    if "$java_exec" -Xverify:none -jar "$jar_file" "${jar_args[@]}"; then
+        log "JAR execution completed successfully (with -Xverify:none)"
+        return 0
+    fi
+
+    # Try with relaxed security
+    warn "Trying with relaxed security settings..."
+    if "$java_exec" -Djava.security.manager= -jar "$jar_file" "${jar_args[@]}"; then
+        log "JAR execution completed successfully (with relaxed security)"
+        return 0
+    fi
+
+    # Try with both flags
+    warn "Trying with both disabled verification and relaxed security..."
+    if "$java_exec" -Xverify:none -Djava.security.manager= -jar "$jar_file" "${jar_args[@]}"; then
+        log "JAR execution completed successfully (with all workarounds)"
+        return 0
+    fi
+
+    error "JAR execution failed with all attempted workarounds"
+    error "This may be due to:"
+    error "  - Corrupted or invalid bytecode in JAR file"
+    error "  - Aggressive obfuscation creating illegal field names"
+    error "  - Missing dependencies"
+         error "  - Fundamental compatibility issues"
+     return 1
+}
+
+# Main function
+main() {
+    local jar_file=""
+    local jar_args=()
+    local dry_run=false
+    local keep_runtime=false
+    local try_fallback=true
+    local force_workarounds=false
+    local no_cache=false
+
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -v|--verbose)
+                export DEBUG=1
+                shift
+                ;;
+            -d|--debug)
+                export DEBUG=1
+                shift
+                ;;
+            --java-version)
+                JAVA_VERSION="$2"
+                shift 2
+                ;;
+            --keep-runtime)
+                keep_runtime=true
+                shift
+                ;;
+            --no-fallback)
+                try_fallback=false
+                shift
+                ;;
+            --force-workarounds)
+                force_workarounds=true
+                shift
+                ;;
+            --no-cache)
+                no_cache=true
+                shift
+                ;;
+            --cache-info)
+                show_cache_info
+                exit 0
+                ;;
+            --clean-cache)
+                clean_cache
+                exit 0
+                ;;
+            --force-cleanup-runtimes)
+                force_cleanup_runtimes
+                exit 0
+                ;;
+            --list-versions)
+                show_supported_versions
+                exit 0
+                ;;
+            --dry-run)
+                dry_run=true
+                shift
+                ;;
+            -*)
+                error "Unknown option: $1"
+                show_usage
+                exit 1
+                ;;
+            *)
+                if [ -z "$jar_file" ]; then
+                    jar_file="$1"
+                else
+                    jar_args+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Validate arguments
+    if [ -z "$jar_file" ]; then
+        error "JAR file argument is required"
+        show_usage
+        exit 1
+    fi
+
+    # Dry run mode
+    if [ "$dry_run" = true ]; then
+        local os arch
+        os="$(detect_os)"
+        arch="$(detect_architecture)"
+
+        echo "Dry run mode - would execute:"
+        echo "  JAR file: $jar_file"
+        echo "  Java version: $JAVA_VERSION"
+        echo "  System: $os/$arch"
+        echo "  Keep runtime: $keep_runtime"
+        echo "  Use fallback versions: $try_fallback"
+        echo "  Force workarounds: $force_workarounds"
+        echo "  Use cache: $([ "$no_cache" = true ] && echo "false" || echo "true")"
+        echo "  Available versions: Use --list-versions to see all supported versions"
+        if [ "${#jar_args[@]}" -gt 0 ]; then
+            echo "  Arguments: ${jar_args[*]}"
+        fi
+        exit 0
+    fi
+
+    # Disable cleanup if requested
+    if [ "$keep_runtime" = true ]; then
+        log "Runtime will be kept after execution"
+        trap - EXIT INT TERM
+        CLEANUP_REGISTERED=false
+    fi
+
+    # Run the JAR file
+    if [ "$try_fallback" = true ]; then
+        # Use fallback versions if the first one fails
+        if ! run_jar "$jar_file" "$no_cache" "$force_workarounds" "${jar_args[@]}" 2>/dev/null; then
+            log "Primary Java version failed, trying fallback versions..."
+            if ! try_with_fallback_versions "$jar_file" "$no_cache" "$force_workarounds" "${jar_args[@]}"; then
+                exit 1
+            fi
+        fi
+    else
+        if ! run_jar "$jar_file" "$no_cache" "$force_workarounds" "${jar_args[@]}"; then
+            exit 1
+        fi
+    fi
+
+    # Show runtime location if keeping it
+    if [ "$keep_runtime" = true ] && [ -n "$TEMP_DIR" ]; then
+        log "Java runtime location: $JAVA_DIR"
+        log "To clean up manually: rm -rf $TEMP_DIR"
+    fi
+}
+
+# Run main function if script is executed directly
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    main "$@"
+fi
