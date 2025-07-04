@@ -97,7 +97,7 @@ jobs:
           echo "✓ Dry run works on ${{ matrix.os }}"
 
           # Test actual execution
-          ./runjar test.jar | grep -q "Cross-platform test" || \
+          ./runjar test.jar | grep -q "Hello, World!" || \
             (echo "FAIL: JAR execution does not work on ${{ matrix.os }}" && exit 1)
           echo "✓ JAR execution works on ${{ matrix.os }}"
 
