@@ -77,7 +77,8 @@ jobs:
           echo "Testing basic functionality on ${{ matrix.os }}..."
 
           # Test help flag
-          ./runjar --help | grep -q "Usage:" || (echo "FAIL: Help does not work on ${{ matrix.os }}" && exit 1)
+          ./runjar --help | grep -q "Usage:" || \
+            (echo "FAIL: Help does not work on ${{ matrix.os }}" && exit 1)
           echo "✓ Help flag works on ${{ matrix.os }}"
 
           # Test list versions
@@ -96,7 +97,7 @@ jobs:
           echo "✓ Dry run works on ${{ matrix.os }}"
 
           # Test actual execution
-          ./runjar test.jar | grep -q "Hello, World!" || \
+          ./runjar test.jar | grep -q "Cross-platform test" || \
             (echo "FAIL: JAR execution does not work on ${{ matrix.os }}" && exit 1)
           echo "✓ JAR execution works on ${{ matrix.os }}"
 

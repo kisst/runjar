@@ -647,6 +647,15 @@ download_java() {
     # Move to final location
     mv "$extracted_dir" "$JAVA_DIR"
 
+    # Fix for macOS JDKs packaged with Contents/Home structure
+    if [ ! -x "$JAVA_DIR/bin/java" ] && [ -d "$JAVA_DIR/Contents/Home" ]; then
+        debug "Detected macOS JDK structure, adjusting path"
+        mv "$JAVA_DIR/Contents/Home" "$TEMP_DIR/java-home"
+        rm -rf "$JAVA_DIR"
+        JAVA_DIR="$TEMP_DIR/java-home"
+        log "Adjusted Java directory to: $JAVA_DIR"
+    fi
+
     # Remove temporary files
     rm -f "$temp_file"
     rm -rf "$extract_dir"
