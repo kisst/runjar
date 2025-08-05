@@ -159,7 +159,7 @@ The project includes comprehensive automated testing that covers:
 - **Error handling** - Invalid JARs, missing files, bad options
 - **Directory naming** - JAR filename inclusion in temp directories
 - **Edge cases** - Special characters, long filenames, concurrent execution
-- **Multi-OS compatibility** - Linux and macOS testing
+- **Linux compatibility** - Comprehensive Linux testing
 - **Performance testing** - Execution timing and resource usage
 
 **Benefits of using `gh act` for local testing:**
@@ -182,7 +182,7 @@ Contributions, bug reports, and feature requests are welcome! Please feel free t
 
 - **Open an issue** for bugs or feature requests
 - **Submit a pull request** with improvements
-- **Test on different platforms** and report compatibility
+- **Test on Linux systems** and report compatibility
 - **Improve documentation** or add examples
 
 The project includes comprehensive test coverage - just run `gh act` to test your changes locally before submitting.
